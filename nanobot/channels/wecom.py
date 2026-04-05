@@ -544,7 +544,7 @@ class WecomChannel(BaseChannel):
                         frame,
                         stream_id,
                         "正在处理...",
-                        False,
+                        finish=False,
                     )
                     logger.info("WeCom progress stream started for {}", msg.chat_id)
 
@@ -554,7 +554,7 @@ class WecomChannel(BaseChannel):
                         frame,
                         stream_id,
                         content,
-                        False,
+                        finish=False,
                     )
                     logger.info("WeCom progress update sent to {}", msg.chat_id)
 
@@ -568,7 +568,7 @@ class WecomChannel(BaseChannel):
                         frame,
                         progress_stream_id,
                         "处理完成",
-                        True,
+                        finish=True,
                     )
                     logger.info("WeCom progress stream ended for {}", msg.chat_id)
 
@@ -582,7 +582,7 @@ class WecomChannel(BaseChannel):
                                 frame,
                                 result_stream_id,
                                 content,
-                                True,
+                                finish=True,
                             )
                             logger.info("WeCom streaming result sent to {}", msg.chat_id)
                         # Send media files if any
@@ -659,7 +659,7 @@ class WecomChannel(BaseChannel):
                         frame,
                         stream_id,
                         accumulated_text,
-                        True,
+                        finish=True,
                     )
                     logger.info("WeCom result stream ended for {}", chat_id)
                 except Exception as e:
@@ -687,7 +687,7 @@ class WecomChannel(BaseChannel):
                     frame,
                     stream_id,
                     accumulated_text,
-                    False,
+                    finish=False,
                 )
                 logger.debug("WeCom result delta sent to {} ({} chars)", chat_id, len(accumulated_text))
             except Exception as e:
