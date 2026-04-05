@@ -1,9 +1,13 @@
 """WeCom (Enterprise WeChat) channel implementation using wecom_aibot_sdk."""
 
 import asyncio
+import base64
+import hashlib
 import importlib.util
+import json
 import os
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -25,6 +29,7 @@ class WecomConfig(Base):
     secret: str = ""
     allow_from: list[str] = Field(default_factory=list)
     welcome_message: str = ""
+    streaming: bool = True  # Stream final results; if False, send as normal message
 
 
 # Message type display mapping
@@ -64,6 +69,11 @@ class WecomChannel(BaseChannel):
         self._generate_req_id = None
         # Store frame headers for each chat to enable replies
         self._chat_frames: dict[str, Any] = {}
+        # Store stream IDs for each chat to enable progress updates
+        self._stream_ids: dict[str, str] = {}
+        # Store result stream state for streaming results
+        self._result_stream_bufs: dict[str, str] = {}  # chat_id -> accumulated text
+        self._result_stream_ids: dict[str, str] = {}  # chat_id -> stream_id
 
     async def start(self) -> None:
         """Start the WeCom bot with WebSocket long connection."""
@@ -82,13 +92,13 @@ class WecomChannel(BaseChannel):
         self._generate_req_id = generate_req_id
 
         # Create WebSocket client
-        self._client = WSClient({
-            "bot_id": self.config.bot_id,
-            "secret": self.config.secret,
-            "reconnect_interval": 1000,
-            "max_reconnect_attempts": -1,  # Infinite reconnect
-            "heartbeat_interval": 30000,
-        })
+        self._client = WSClient(
+            self.config.bot_id,
+            self.config.secret,
+            reconnect_interval=1000,
+            max_reconnect_attempts=-1,  # Infinite reconnect
+            heartbeat_interval=30000,
+        )
 
         # Register event handlers
         self._client.on("connected", self._on_connected)
@@ -106,7 +116,7 @@ class WecomChannel(BaseChannel):
         logger.info("No public IP required - using WebSocket to receive events")
 
         # Connect
-        await self._client.connect_async()
+        await self._client.connect()
 
         # Keep running until stopped
         while self._running:
@@ -119,11 +129,11 @@ class WecomChannel(BaseChannel):
             await self._client.disconnect()
         logger.info("WeCom bot stopped")
 
-    async def _on_connected(self, frame: Any) -> None:
+    async def _on_connected(self, frame: Any = None) -> None:
         """Handle WebSocket connected event."""
         logger.info("WeCom WebSocket connected")
 
-    async def _on_authenticated(self, frame: Any) -> None:
+    async def _on_authenticated(self, frame: Any = None) -> None:
         """Handle authentication success event."""
         logger.info("WeCom authenticated successfully")
 
@@ -336,36 +346,350 @@ class WecomChannel(BaseChannel):
             logger.error("Error downloading media: {}", e)
             return None
 
+    # ========== Image processing helper methods ==========
+
+    @staticmethod
+    def _is_image_url(path: str) -> bool:
+        """Check if path is an HTTP/HTTPS URL."""
+        return path.startswith(("http://", "https://"))
+
+    @staticmethod
+    def _get_image_extension(path: str) -> str:
+        """Get image file extension from path."""
+        ext = Path(path).suffix.lower()
+        # Normalize common extensions
+        if ext in (".jpg", ".jpeg"):
+            return ".jpg"
+        elif ext == ".png":
+            return ".png"
+        elif ext == ".gif":
+            return ".gif"
+        return ext
+
+    @staticmethod
+    def _validate_image_size(size: int) -> bool:
+        """Validate image size (≤10MB for WeCom)."""
+        MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
+        return size <= MAX_IMAGE_SIZE
+
+    @staticmethod
+    def _get_media_type(file_path: str) -> str:
+        """
+        Determine WeCom media type based on file extension.
+
+        Returns:
+            One of: "image", "video", "voice", "file"
+        """
+        ext = Path(file_path).suffix.lower()
+
+        # Image formats
+        if ext in (".jpg", ".jpeg", ".png", ".gif"):
+            return "image"
+        # Video formats
+        if ext in (".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv"):
+            return "video"
+        # Voice/Audio formats
+        if ext in (".mp3", ".wav", ".amr", ".m4a", ".aac", ".ogg"):
+            return "voice"
+        # Everything else as file
+        return "file"
+
+    def _read_and_encode_image(self, file_path: str) -> tuple[str, str] | None:
+        """
+        Read local image file and encode as Base64 with MD5 checksum.
+
+        Returns:
+            (base64_encoded_data, md5_hash) or None if failed
+        """
+        try:
+            p = Path(file_path)
+            if not p.is_file():
+                logger.warning("Image file not found: {}", file_path)
+                return None
+
+            # Validate file extension
+            ext = self._get_image_extension(file_path)
+            if ext not in (".jpg", ".jpeg", ".png", ".gif"):
+                logger.warning("Unsupported image format {}: {} (only JPG/PNG/GIF supported)", ext, file_path)
+                return None
+
+            # Read raw image data
+            raw_data = p.read_bytes()
+            logger.debug("Read image file: {}, size: {} bytes", file_path, len(raw_data))
+
+            # Validate size
+            if not self._validate_image_size(len(raw_data)):
+                logger.warning("Image file too large (>10MB): {}", file_path)
+                return None
+
+            # Calculate MD5 of original content
+            md5_hash = hashlib.md5(raw_data).hexdigest()
+
+            # Encode as Base64
+            base64_data = base64.b64encode(raw_data).decode("utf-8")
+            logger.debug("Image encoded: Base64 length: {}, MD5: {}", len(base64_data), md5_hash)
+
+            return base64_data, md5_hash
+
+        except Exception as e:
+            logger.error("Error reading image {}: {} | Error: {}", file_path, e, e)
+            return None
+
+    async def _upload_media(self, file_data: bytes, media_type: str, filename: str) -> str | None:
+        """
+        Upload media data to WeCom via SDK and return media_id.
+
+        Args:
+            file_data: Raw file bytes.
+            media_type: One of "image", "video", "voice", "file".
+            filename: Filename for the upload.
+
+        Returns:
+            media_id or None if upload failed.
+        """
+        try:
+            result = await self._client.upload_media(
+                file_data, type=media_type, filename=filename
+            )
+            media_id = result.get("media_id")
+            if media_id:
+                logger.info("Uploaded {} {} , media_id: {}", media_type, filename, media_id)
+            else:
+                logger.error("Upload returned no media_id: {}", result)
+            return media_id
+        except Exception as e:
+            logger.error("Error uploading {} {}: {}", media_type, filename, e)
+            return None
+
+    async def _upload_local_media(self, file_path: str) -> str | None:
+        """Read local media file and upload via SDK."""
+        try:
+            p = Path(file_path)
+            if not p.is_file():
+                logger.warning("Media file not found: {}", file_path)
+                return None
+
+            raw_data = p.read_bytes()
+            # Use 50MB as max for general files (SDK supports up to ~50MB)
+            MAX_FILE_SIZE = 50 * 1024 * 1024
+            if len(raw_data) > MAX_FILE_SIZE:
+                logger.warning("File too large (>50MB): {}", file_path)
+                return None
+
+            media_type = self._get_media_type(file_path)
+            return await self._upload_media(raw_data, media_type, p.name)
+        except Exception as e:
+            logger.error("Error reading local media {}: {}", file_path, e)
+            return None
+
+    async def _download_and_upload_media(self, url: str) -> str | None:
+        """Download media from URL and upload via SDK."""
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                raw_data = resp.content
+
+            # Extract filename from URL, fallback to file.bin
+            filename = Path(url).name or "file.bin"
+            # Strip query parameters from filename
+            if "?" in filename:
+                filename = filename.split("?")[0]
+            # Ensure filename has an extension
+            if "." not in filename:
+                filename = "file.bin"
+
+            MAX_FILE_SIZE = 50 * 1024 * 1024
+            if len(raw_data) > MAX_FILE_SIZE:
+                logger.warning("Downloaded file too large (>50MB): {}", url)
+                return None
+
+            media_type = self._get_media_type(filename)
+            return await self._upload_media(raw_data, media_type, filename)
+        except Exception as e:
+            logger.error("Error downloading media {}: {}", url, e)
+            return None
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WeCom."""
         if not self._client:
             logger.warning("WeCom client not initialized")
             return
 
+        # Get the stored frame for this chat
+        frame = self._chat_frames.get(msg.chat_id)
+        if not frame:
+            logger.warning("No frame found for chat {}, cannot reply", msg.chat_id)
+            return
+
+        # Check if this is a progress message
+        is_progress = bool((msg.metadata or {}).get("_progress", False))
+
         try:
             content = msg.content.strip()
-            if not content:
-                return
 
-            # Get the stored frame for this chat
-            frame = self._chat_frames.get(msg.chat_id)
-            if not frame:
-                logger.warning("No frame found for chat {}, cannot reply", msg.chat_id)
-                return
+            if is_progress:
+                # === Progress message flow ===
+                # Check if this is the first progress message for this chat
+                stream_id = self._stream_ids.get(msg.chat_id)
+                is_first_progress = stream_id is None
 
-            # Use streaming reply for better UX
-            stream_id = self._generate_req_id("stream")
+                if is_first_progress:
+                    # First progress: create new stream and send "正在处理..."
+                    stream_id = self._generate_req_id("stream")
+                    self._stream_ids[msg.chat_id] = stream_id
+                    await self._client.reply_stream(
+                        frame,
+                        stream_id,
+                        "正在处理...",
+                        False,
+                    )
+                    logger.info("WeCom progress stream started for {}", msg.chat_id)
 
-            # Send as streaming message with finish=True
-            await self._client.reply_stream(
-                frame,
-                stream_id,
-                content,
-                finish=True,
-            )
+                # Send progress content update
+                if content:
+                    await self._client.reply_stream(
+                        frame,
+                        stream_id,
+                        content,
+                        False,
+                    )
+                    logger.info("WeCom progress update sent to {}", msg.chat_id)
 
-            logger.debug("WeCom message sent to {}", msg.chat_id)
+            else:
+                # === Final message flow ===
+                # Check if there's an active progress stream
+                progress_stream_id = self._stream_ids.pop(msg.chat_id, None)
+                if progress_stream_id:
+                    # End progress stream with "处理完成"
+                    await self._client.reply_stream(
+                        frame,
+                        progress_stream_id,
+                        "处理完成",
+                        True,
+                    )
+                    logger.info("WeCom progress stream ended for {}", msg.chat_id)
+
+                # Send final result based on streaming config
+                if content or msg.media:
+                    if self.config.streaming:
+                        # Streaming mode: send as new stream
+                        result_stream_id = self._generate_req_id("stream")
+                        if content:
+                            await self._client.reply_stream(
+                                frame,
+                                result_stream_id,
+                                content,
+                                True,
+                            )
+                            logger.info("WeCom streaming result sent to {}", msg.chat_id)
+                        # Send media files if any
+                        if msg.media:
+                            await self._send_media_files(frame, msg.media, msg.chat_id)
+                    else:
+                        # Non-streaming mode: send as normal message
+                        if content:
+                            await self._client.reply(frame, content)
+                            logger.info("WeCom normal result sent to {}", msg.chat_id)
+                        # Send media files if any
+                        if msg.media:
+                            await self._send_media_files(frame, msg.media, msg.chat_id)
 
         except Exception as e:
             logger.error("Error sending WeCom message: {}", e)
             raise
+
+    async def _send_media_files(self, frame: Any, media_paths: list[str], chat_id: str) -> None:
+        """Helper method to send media files."""
+        logger.info("Processing {} media file(s)", len(media_paths))
+        for media_path in media_paths:
+            try:
+                if self._is_image_url(media_path):
+                    # URL: download then upload via SDK
+                    media_id = await self._download_and_upload_media(media_path)
+                else:
+                    # Local file: read and upload via SDK
+                    media_id = await self._upload_local_media(media_path)
+
+                if media_id:
+                    # Get correct media type based on extension
+                    media_type = self._get_media_type(media_path)
+                    await self._client.reply_media(frame, media_type, media_id)
+                    logger.info("WeCom {} sent to {}", media_type, chat_id)
+                else:
+                    logger.warning("Failed to prepare media: {}", media_path)
+            except Exception as e:
+                logger.error("Error processing media {}: {}", media_path, e)
+
+    async def send_delta(self, chat_id: str, delta: str, metadata: dict[str, Any] | None = None) -> None:
+        """Send streaming text chunks for real-time result display.
+        
+        Args:
+            chat_id: The chat ID to send to
+            delta: Text chunk to send
+            metadata: Metadata containing _stream_delta and _stream_end flags
+        """
+        if not self._client:
+            logger.warning("WeCom client not initialized")
+            return
+
+        # Get the stored frame for this chat
+        frame = self._chat_frames.get(chat_id)
+        if not frame:
+            logger.warning("No frame found for chat {}, cannot send delta", chat_id)
+            return
+
+        meta = metadata or {}
+
+        # Handle stream end: send final message and clean up
+        if meta.get("_stream_end"):
+            stream_id = self._result_stream_ids.pop(chat_id, None)
+            accumulated_text = self._result_stream_bufs.pop(chat_id, None)
+
+            if not stream_id or accumulated_text is None:
+                logger.warning("No active result stream for chat {}", chat_id)
+                return
+
+            # Send final accumulated text with finish=True
+            if accumulated_text.strip():
+                try:
+                    await self._client.reply_stream(
+                        frame,
+                        stream_id,
+                        accumulated_text,
+                        True,
+                    )
+                    logger.info("WeCom result stream ended for {}", chat_id)
+                except Exception as e:
+                    logger.error("Error sending final delta: {}", e)
+                    raise
+            return
+
+        # Accumulate delta text
+        if chat_id not in self._result_stream_bufs:
+            # First delta: create new stream
+            stream_id = self._generate_req_id("stream")
+            self._result_stream_ids[chat_id] = stream_id
+            self._result_stream_bufs[chat_id] = ""
+        else:
+            stream_id = self._result_stream_ids[chat_id]
+
+        # Append delta to buffer
+        self._result_stream_bufs[chat_id] += delta
+        accumulated_text = self._result_stream_bufs[chat_id]
+
+        # Send update if we have meaningful content
+        if accumulated_text.strip():
+            try:
+                await self._client.reply_stream(
+                    frame,
+                    stream_id,
+                    accumulated_text,
+                    False,
+                )
+                logger.debug("WeCom result delta sent to {} ({} chars)", chat_id, len(accumulated_text))
+            except Exception as e:
+                logger.error("Error sending delta: {}", e)
+                raise
