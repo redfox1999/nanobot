@@ -225,6 +225,8 @@ class WecomChannel(BaseChannel):
             # For group chat, chatid is provided in body
             chat_type = body.get("chattype", "single")
             chat_id = body.get("chatid", sender_id)
+            
+            logger.info("chat_type: {}, chat_id: {}", chat_type, chat_id)
 
             content_parts = []
 
@@ -274,6 +276,7 @@ class WecomChannel(BaseChannel):
 
             elif msg_type == "mixed":
                 # Mixed content contains multiple message items
+                # For each item, check the type and extract content accordingly。 file or image...
                 msg_items = body.get("mixed", {}).get("item", [])
                 for item in msg_items:
                     item_type = item.get("type", "")
